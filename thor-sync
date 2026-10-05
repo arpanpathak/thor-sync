@@ -14,7 +14,8 @@
 #
 # A folder under your home lands at the same place under the Thor's home,
 # e.g. ~/Projects/edgechat -> ~/Projects/edgechat. Skipped: anything the
-# folder's .gitignore skips, plus the patterns in ~/.config/thor-sync/exclude.
+# folder's .gitignore skips, plus the patterns in ~/.config/thor-sync/exclude;
+# patterns in ~/.config/thor-sync/include are copied even if ignored.
 # Deleting a file here never deletes it on the Thor.
 set -euo pipefail
 
@@ -22,10 +23,12 @@ CONFIG="${HOME}/.config/thor-sync"
 THOR="${THOR:-$(cat "${CONFIG}/host" 2>/dev/null || echo thor)}"
 LIST="${CONFIG}/folders"
 EXCLUDE="${CONFIG}/exclude"
+INCLUDE="${CONFIG}/include"
 SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
 
 mkdir -p "$CONFIG"
 touch "$LIST"
+[ -f "$INCLUDE" ] || printf '# rsync patterns to copy even when .gitignore skips them, e.g. /data/***\n' > "$INCLUDE"
 [ -f "$EXCLUDE" ] || cat > "$EXCLUDE" <<'EOF'
 target/
 node_modules/
@@ -56,7 +59,7 @@ sync_folder() {
     return
   fi
   $SSH -n "$THOR" "mkdir -p '$remote'"
-  rsync -az --filter=':- .gitignore' --exclude-from="$EXCLUDE" -e "$SSH" \
+  rsync -az --include-from="$INCLUDE" --filter=':- .gitignore' --exclude-from="$EXCLUDE" -e "$SSH" \
     --itemize-changes "$folder/" "$THOR:$remote/" < /dev/null \
     | grep -v '^\.' | sed "s|^|$(basename "$folder"): |" || true
   SYNCED=$((SYNCED + 1))
