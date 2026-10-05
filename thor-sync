@@ -1,0 +1,143 @@
+#!/usr/bin/env bash
+# thor-sync: keeps folders on this machine copied to the Jetson Thor.
+#
+#   thor-sync              sync every folder in the list
+#   thor-sync add [DIR]    add a folder (default: the one you are in) and sync it
+#   thor-sync rm [DIR]     take a folder off the list (its copy on the Thor stays)
+#   thor-sync ls           show the list
+#   thor-sync watch        sync the list every 2 seconds until Ctrl+C
+#   thor-sync on           keep syncing in the background, also after reboot
+#   thor-sync off          stop the background sync
+#   thor-sync log          follow the background sync
+#   thor-sync host [NAME]  show or set the device: an SSH alias, user@ip, or
+#                          a Tailscale name such as user@thor
+#
+# A folder under your home lands at the same place under the Thor's home,
+# e.g. ~/Projects/edgechat -> ~/Projects/edgechat. Skipped: anything the
+# folder's .gitignore skips, plus the patterns in ~/.config/thor-sync/exclude.
+# Deleting a file here never deletes it on the Thor.
+set -euo pipefail
+
+CONFIG="${HOME}/.config/thor-sync"
+THOR="${THOR:-$(cat "${CONFIG}/host" 2>/dev/null || echo thor)}"
+LIST="${CONFIG}/folders"
+EXCLUDE="${CONFIG}/exclude"
+SSH="ssh -o BatchMode=yes -o ConnectTimeout=5"
+
+mkdir -p "$CONFIG"
+touch "$LIST"
+[ -f "$EXCLUDE" ] || cat > "$EXCLUDE" <<'EOF'
+target/
+node_modules/
+.venv/
+venv/
+__pycache__/
+corpus/
+convo_datastore/
+experimental/models/
+*.gguf
+*.safetensors
+*.engine
+*.swp
+EOF
+
+remote_path() {
+  case "$1" in
+    "$HOME"/*) printf '%s' "${1#"$HOME"/}" ;;
+    *) printf 'synced/%s' "$(basename "$1")" ;;
+  esac
+}
+
+sync_folder() {
+  local folder="$1" remote
+  remote="$(remote_path "$folder")"
+  if [ ! -d "$folder" ]; then
+    echo "missing: $folder (thor-sync rm $folder to drop it)"
+    return
+  fi
+  $SSH -n "$THOR" "mkdir -p '$remote'"
+  rsync -az --filter=':- .gitignore' --exclude-from="$EXCLUDE" -e "$SSH" \
+    --itemize-changes "$folder/" "$THOR:$remote/" < /dev/null \
+    | grep -v '^\.' | sed "s|^|$(basename "$folder"): |" || true
+  SYNCED=$((SYNCED + 1))
+}
+
+SYNCED=0
+
+sync_all() {
+  local folders
+  mapfile -t folders < "$LIST"
+  for folder in "${folders[@]}"; do
+    [ -n "$folder" ] && sync_folder "$folder"
+  done
+}
+
+absolute() { (cd "${1:-.}" && pwd); }
+
+if [ "${1:-}" = "host" ]; then
+  if [ -n "${2:-}" ]; then
+    echo "$2" > "${CONFIG}/host"
+    echo "device set to $2"
+  else
+    echo "$THOR"
+  fi
+  exit 0
+fi
+
+if ! $SSH "$THOR" true 2>/dev/null; then
+  echo "cannot reach $THOR without a password."
+  echo "once: ssh-keygen -t ed25519 -N '' -f ~/.ssh/id_ed25519; ssh-copy-id $THOR"
+  echo "or set the device: thor-sync host user@name"
+  exit 1
+fi
+
+case "${1:-}" in
+  "")
+    [ -s "$LIST" ] || { echo "list is empty: cd into a folder and run thor-sync add"; exit 0; }
+    sync_all
+    echo "synced $SYNCED of $(grep -c . "$LIST") folders to $THOR"
+    ;;
+  add)
+    folder="$(absolute "${2:-.}")"
+    grep -qxF "$folder" "$LIST" || echo "$folder" >> "$LIST"
+    sync_folder "$folder"
+    echo "added and synced $folder -> $THOR:~/$(remote_path "$folder")"
+    ;;
+  rm)
+    folder="$(absolute "${2:-.}")"
+    grep -vxF "$folder" "$LIST" > "${LIST}.new" || true
+    mv "${LIST}.new" "$LIST"
+    echo "removed $folder from the list"
+    ;;
+  ls)
+    cat "$LIST"
+    ;;
+  on)
+    unit="${HOME}/.config/systemd/user/thor-sync.service"
+    mkdir -p "$(dirname "$unit")"
+    printf '[Unit]\nDescription=thor-sync watch\n\n[Service]\nExecStart=%s watch\nRestart=always\nRestartSec=10\n\n[Install]\nWantedBy=default.target\n' "$0" > "$unit"
+    systemctl --user daemon-reload
+    systemctl --user enable --now thor-sync >/dev/null 2>&1
+    loginctl enable-linger "$USER" 2>/dev/null || true
+    echo "background sync on: every change reaches the Thor within ~2 s, also after reboot"
+    ;;
+  off)
+    systemctl --user disable --now thor-sync >/dev/null 2>&1 || true
+    rm -f "${HOME}/.config/systemd/user/thor-sync.service"
+    systemctl --user daemon-reload
+    echo "background sync off"
+    ;;
+  log)
+    journalctl --user -u thor-sync -f
+    ;;
+  watch)
+    echo "syncing $(grep -c . "$LIST") folders every 2 s (Ctrl+C stops)"
+    while true; do
+      sync_all
+      sleep 2
+    done
+    ;;
+  *)
+    sed -n '2,19p' "$0" | sed 's/^# \{0,1\}//'
+    ;;
+esac
